@@ -25,7 +25,8 @@ interface QueueItem {
 interface RunResult {
   success: boolean;
   requestId: string;
-  message: string;
+  message?: string;
+  error?: string;
   duration: number;
 }
 
@@ -153,7 +154,7 @@ function enqueue(requestId: string, params: RescheduleParams): Promise<RunResult
         resolve({
           success: false,
           requestId,
-          message: 'Request timed out waiting in queue. Try again later.',
+          error: 'Request timed out waiting in queue. Try again later.',
           duration: 0,
         });
       }
@@ -182,12 +183,9 @@ async function processQueue() {
     const start = Date.now();
     const result = await rescheduleAppointment(item.params);
     const duration = Math.round((Date.now() - start) / 1000);
-    const runResult: RunResult = {
-      success: result.success,
-      requestId: item.id,
-      message: result.message,
-      duration,
-    };
+    const runResult: RunResult = result.success
+      ? { success: true, requestId: item.id, message: result.message, duration }
+      : { success: false, requestId: item.id, error: result.message, duration };
     totalProcessed++;
     if (result.success) totalSuccess++;
     else totalFailed++;
@@ -204,7 +202,7 @@ async function processQueue() {
     const errorResult: RunResult = {
       success: false,
       requestId: item.id,
-      message: err.message || 'Unknown error',
+      error: err.message || 'An unexpected error occurred.',
       duration: 0,
     };
     log(`[${item.id}] ERROR: client=${item.params.clientSearch} — ${err.message}`);
@@ -242,7 +240,7 @@ function shutdown(signal: string) {
 
   while (queue.length > 0) {
     const item = queue.shift()!;
-    item.resolve({ success: false, requestId: item.id, message: 'Server shutting down', duration: 0 });
+    item.resolve({ success: false, requestId: item.id, error: 'Server shutting down', duration: 0 });
   }
 
   server.close(() => {

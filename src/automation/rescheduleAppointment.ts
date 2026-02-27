@@ -243,9 +243,60 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
     return { success: true, message: `Appointment rescheduled to ${data.newDate} at ${data.newTime}` };
 
   } catch (error: any) {
-    console.error('❌ Reschedule failed:', error.message);
-    return { success: false, message: error.message };
+    const friendlyMessage = cleanErrorMessage(error.message || 'Unknown error');
+    console.error('❌ Reschedule failed:', friendlyMessage);
+    return { success: false, message: friendlyMessage };
   } finally {
     if (browser) await browser.close();
   }
+}
+
+/**
+ * Convert raw Playwright errors into clean, human-readable messages.
+ */
+function cleanErrorMessage(raw: string): string {
+  // Strip Playwright log blocks:  ===== logs =====\n...\n============
+  let msg = raw.replace(/=+\s*logs\s*=+[\s\S]*?=+/gi, '').trim();
+
+  // Strip "page.xxx:" or "locator.xxx:" prefixes
+  msg = msg.replace(/^(page|locator|browser|context)\.\w+(\.\w+)*:\s*/i, '').trim();
+
+  // Map common Playwright errors to friendly messages
+  if (/timeout\s*\d+ms\s*exceeded/i.test(msg)) {
+    if (/waitForURL/i.test(raw) || /secure\.simplepractice/i.test(raw)) {
+      return 'Login timed out. SimplePractice may be slow or credentials may be incorrect.';
+    }
+    if (/waitForLoadState/i.test(raw)) {
+      return 'Page took too long to load. SimplePractice may be experiencing slowness.';
+    }
+    if (/waitFor/i.test(raw) && /search/i.test(raw)) {
+      return 'Client search timed out. The search box did not appear in time.';
+    }
+    if (/waitFor/i.test(raw) && /start date/i.test(raw)) {
+      return 'Appointment form did not load in time.';
+    }
+    return 'Operation timed out. SimplePractice may be slow or unresponsive. Please try again.';
+  }
+
+  if (/no upcoming appointments/i.test(msg)) {
+    return msg; // already clean
+  }
+
+  if (/no clickable appointment/i.test(msg)) {
+    return msg; // already clean
+  }
+
+  if (/no appointment found matching/i.test(msg)) {
+    return msg; // already clean
+  }
+
+  // Remove any remaining newlines / excess whitespace
+  msg = msg.replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+  // Cap length
+  if (msg.length > 200) {
+    msg = msg.substring(0, 200) + '...';
+  }
+
+  return msg || 'An unexpected error occurred during the reschedule process.';
 }
