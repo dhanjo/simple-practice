@@ -4,6 +4,7 @@ export interface RescheduleParams {
   clientSearch: string;
   newDate: string;   // MM/DD/YYYY
   newTime: string;   // HH:MM AM/PM
+  currentAppointmentDate?: string; // MM/DD/YYYY — optional: pick a specific appointment to reschedule
 }
 
 export interface RescheduleResult {
@@ -133,18 +134,57 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
     }
     await page.waitForTimeout(500);
 
-    // ── 6. Click first upcoming appointment ─────────────────────
-    const firstAppointment = page
+    // ── 6. Click the target upcoming appointment ──────────────────
+    const allAppointments = page
       .locator('text=Upcoming appointments')
-      .locator('xpath=following::a[contains(@id,"ember")]')
-      .first();
-    const appointmentVisible = await firstAppointment.isVisible({ timeout: 15_000 }).catch(() => false);
-    if (!appointmentVisible) {
+      .locator('xpath=following::a[contains(@id,"ember")]');
+    const appointmentCount = await allAppointments.count();
+    if (appointmentCount === 0) {
       throw new Error(`No clickable appointment link found for client "${data.clientSearch}".`);
     }
-    step('Clicking first upcoming appointment');
+    step(`Found ${appointmentCount} upcoming appointment(s)`);
+
+    let targetAppointment;
+
+    if (data.currentAppointmentDate) {
+      // Convert MM/DD/YYYY to possible display formats to match against
+      const [mm, dd, yyyy] = data.currentAppointmentDate.split('/');
+      const dateObj = new Date(parseInt(yyyy), parseInt(mm) - 1, parseInt(dd));
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const monthShort = monthNames[dateObj.getMonth()];
+      const dayNum = dateObj.getDate().toString();
+      // SimplePractice typically shows dates like "Mar 6, 2026" or "03/06/2026"
+      const possibleFormats = [
+        `${monthShort} ${dayNum}, ${yyyy}`,           // Mar 6, 2026
+        `${monthShort} ${dd}, ${yyyy}`,               // Mar 06, 2026
+        data.currentAppointmentDate,                   // 03/06/2026
+        `${mm}/${dd}/${yyyy}`,                         // 03/06/2026
+      ];
+      step(`Looking for appointment matching date: ${data.currentAppointmentDate} (formats: ${possibleFormats.join(' | ')})`);
+
+      let found = false;
+      for (let i = 0; i < appointmentCount; i++) {
+        const apptLink = allAppointments.nth(i);
+        const apptText = (await apptLink.textContent()) || '';
+        step(`  Appointment ${i + 1}: "${apptText.trim()}"`);
+        if (possibleFormats.some(fmt => apptText.includes(fmt))) {
+          targetAppointment = apptLink;
+          step(`  ✅ Matched appointment ${i + 1}`);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        throw new Error(`No appointment found matching date "${data.currentAppointmentDate}" for client "${data.clientSearch}". Found ${appointmentCount} appointment(s) but none matched.`);
+      }
+    } else {
+      // No specific date requested — click the first one
+      targetAppointment = allAppointments.first();
+      step('No currentAppointmentDate specified — selecting first upcoming appointment');
+    }
+
     await page.waitForTimeout(500);
-    await firstAppointment.click();
+    await targetAppointment!.click();
 
     // ── 7. Wait for appointment form ────────────────────────────
     step('Waiting for appointment form');

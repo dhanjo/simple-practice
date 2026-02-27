@@ -80,7 +80,7 @@ function authMiddleware(
 
 app.post('/api/reschedule', authMiddleware, async (req, res) => {
   const requestId = generateRequestId();
-  const { clientSearch, newDate, newTime } = req.body as RescheduleParams;
+  const { clientSearch, newDate, newTime, currentAppointmentDate } = req.body as RescheduleParams;
 
   // ── Validate required fields ──
   if (!clientSearch || !newDate || !newTime) {
@@ -108,6 +108,14 @@ app.post('/api/reschedule', authMiddleware, async (req, res) => {
     });
   }
 
+  if (currentAppointmentDate && !/^[0-9]{2}\/[0-9]{2}\/[0-9]{4}$/.test(currentAppointmentDate)) {
+    return res.status(400).json({
+      success: false,
+      requestId,
+      error: 'currentAppointmentDate must be in MM/DD/YYYY format (e.g. "03/06/2026")',
+    });
+  }
+
   // ── Queue limit check ──
   if (queue.length >= MAX_QUEUE_SIZE) {
     return res.status(429).json({
@@ -118,10 +126,13 @@ app.post('/api/reschedule', authMiddleware, async (req, res) => {
   }
 
   // ── Enqueue and respond when processed ──
-  const position = queue.length + (isRunning ? 1 : 0);
-  log(`[${requestId}] Queued: client=${clientSearch}, date=${newDate}, time=${newTime} (position ${position})`);
+  const params: RescheduleParams = { clientSearch, newDate, newTime };
+  if (currentAppointmentDate) params.currentAppointmentDate = currentAppointmentDate;
 
-  const result = await enqueue(requestId, { clientSearch, newDate, newTime });
+  const position = queue.length + (isRunning ? 1 : 0);
+  log(`[${requestId}] Queued: client=${clientSearch}, date=${newDate}, time=${newTime}${currentAppointmentDate ? `, currentAppt=${currentAppointmentDate}` : ''} (position ${position})`);
+
+  const result = await enqueue(requestId, params);
   res.status(result.success ? 200 : 500).json(result);
 });
 
