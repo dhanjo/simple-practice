@@ -1,15 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
-import { spawn, ChildProcess } from 'child_process';
-import path from 'path';
-import 'dotenv/config';
+import { rescheduleAppointment, RescheduleParams, RescheduleResult } from './automation/rescheduleAppointment';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY; // optional — if set, all requests must include it
-const TEST_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max per test run
-const MAX_QUEUE_SIZE = 50; // max pending requests
+const API_KEY = process.env.API_KEY;
+const MAX_QUEUE_SIZE = 50;
 const QUEUE_WAIT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max wait in queue
 
 app.use(cors());
@@ -17,15 +14,9 @@ app.use(express.json());
 
 /* ── State ────────────────────────────────────────────────────────── */
 
-interface RescheduleBody {
-  clientSearch: string;
-  newDate: string;
-  newTime: string;
-}
-
 interface QueueItem {
   id: string;
-  params: RescheduleBody;
+  params: RescheduleParams;
   resolve: (result: RunResult) => void;
   queuedAt: Date;
   timedOut: boolean;
@@ -34,12 +25,11 @@ interface QueueItem {
 interface RunResult {
   success: boolean;
   requestId: string;
-  output: string;
+  message: string;
   duration: number;
 }
 
 let isRunning = false;
-let currentProcess: ChildProcess | null = null;
 let startedAt: Date | null = null;
 const bootTime = new Date();
 
@@ -62,10 +52,7 @@ function generateRequestId(): string {
   return crypto.randomBytes(6).toString('hex');
 }
 
-/** Strip ANSI escape codes from Playwright output */
-function stripAnsi(str: string): string {
-  return str.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\x1B\]0;[^\x07]*\x07/g, '');
-}
+
 
 /* ── Request logging middleware ────────────────────────────────────── */
 
@@ -93,7 +80,7 @@ function authMiddleware(
 
 app.post('/api/reschedule', authMiddleware, async (req, res) => {
   const requestId = generateRequestId();
-  const { clientSearch, newDate, newTime } = req.body as RescheduleBody;
+  const { clientSearch, newDate, newTime } = req.body as RescheduleParams;
 
   // ── Validate required fields ──
   if (!clientSearch || !newDate || !newTime) {
@@ -140,7 +127,7 @@ app.post('/api/reschedule', authMiddleware, async (req, res) => {
 
 /* ── Queue management ─────────────────────────────────────────────── */
 
-function enqueue(requestId: string, params: RescheduleBody): Promise<RunResult> {
+function enqueue(requestId: string, params: RescheduleParams): Promise<RunResult> {
   return new Promise((resolve) => {
     const item: QueueItem = { id: requestId, params, resolve, queuedAt: new Date(), timedOut: false };
     queue.push(item);
@@ -155,7 +142,7 @@ function enqueue(requestId: string, params: RescheduleBody): Promise<RunResult> 
         resolve({
           success: false,
           requestId,
-          output: 'Request timed out waiting in queue. Try again later.',
+          message: 'Request timed out waiting in queue. Try again later.',
           duration: 0,
         });
       }
@@ -181,31 +168,38 @@ async function processQueue() {
   log(`[${item.id}] Processing: client=${item.params.clientSearch} (waited ${waitTime}s, ${queue.length} remaining)`);
 
   try {
-    const result = await runPlaywrightTest(item.id, item.params);
+    const start = Date.now();
+    const result = await rescheduleAppointment(item.params);
+    const duration = Math.round((Date.now() - start) / 1000);
+    const runResult: RunResult = {
+      success: result.success,
+      requestId: item.id,
+      message: result.message,
+      duration,
+    };
     totalProcessed++;
     if (result.success) totalSuccess++;
     else totalFailed++;
     lastResult = {
-      ...result,
+      ...runResult,
       clientSearch: item.params.clientSearch,
       finishedAt: new Date().toISOString(),
     };
-    log(`[${item.id}] ${result.success ? 'SUCCESS' : 'FAILED'}: client=${item.params.clientSearch} in ${result.duration}s`);
-    item.resolve(result);
+    log(`[${item.id}] ${result.success ? 'SUCCESS' : 'FAILED'}: client=${item.params.clientSearch} in ${duration}s`);
+    item.resolve(runResult);
   } catch (err: any) {
     totalProcessed++;
     totalFailed++;
     const errorResult: RunResult = {
       success: false,
       requestId: item.id,
-      output: err.message || 'Unknown error',
+      message: err.message || 'Unknown error',
       duration: 0,
     };
     log(`[${item.id}] ERROR: client=${item.params.clientSearch} — ${err.message}`);
     item.resolve(errorResult);
   } finally {
     isRunning = false;
-    currentProcess = null;
     startedAt = null;
     processQueue();
   }
@@ -228,50 +222,6 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-/* ── Run the Playwright test as a child process ───────────────────── */
-
-function runPlaywrightTest(requestId: string, params: RescheduleBody): Promise<RunResult> {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    let stdout = '';
-    let stderr = '';
-
-    const testProcess = spawn(
-      'npx',
-      ['playwright', 'test', 'appointment-reschedule'],
-      {
-        cwd: path.resolve(__dirname, '..'),
-        env: {
-          ...process.env,
-          SP_CLIENT_SEARCH: params.clientSearch,
-          SP_NEW_DATE: params.newDate,
-          SP_NEW_TIME: params.newTime,
-        },
-        shell: true,
-      },
-    );
-
-    currentProcess = testProcess;
-
-    const timeout = setTimeout(() => {
-      testProcess.kill('SIGTERM');
-      setTimeout(() => {
-        if (!testProcess.killed) testProcess.kill('SIGKILL');
-      }, 5000);
-    }, TEST_TIMEOUT_MS);
-
-    testProcess.stdout.on('data', (d) => { stdout += d.toString(); });
-    testProcess.stderr.on('data', (d) => { stderr += d.toString(); });
-
-    testProcess.on('close', (code) => {
-      clearTimeout(timeout);
-      const duration = Math.round((Date.now() - start) / 1000);
-      const output = stripAnsi((stdout + '\n' + stderr).trim());
-      resolve({ success: code === 0, requestId, output, duration });
-    });
-  });
-}
-
 /* ── Graceful shutdown ────────────────────────────────────────────── */
 
 let server: ReturnType<typeof app.listen>;
@@ -279,13 +229,9 @@ let server: ReturnType<typeof app.listen>;
 function shutdown(signal: string) {
   log(`${signal} received — shutting down gracefully`);
 
-  if (currentProcess && !currentProcess.killed) {
-    currentProcess.kill('SIGTERM');
-  }
-
   while (queue.length > 0) {
     const item = queue.shift()!;
-    item.resolve({ success: false, requestId: item.id, output: 'Server shutting down', duration: 0 });
+    item.resolve({ success: false, requestId: item.id, message: 'Server shutting down', duration: 0 });
   }
 
   server.close(() => {
