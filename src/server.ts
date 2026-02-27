@@ -5,7 +5,7 @@ import { rescheduleAppointment, RescheduleParams, RescheduleResult } from './aut
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY;
+const API_KEY = process.env.API_KEY || 'sp-reschedule-2026-secure';
 const MAX_QUEUE_SIZE = 50;
 const QUEUE_WAIT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max wait in queue
 
