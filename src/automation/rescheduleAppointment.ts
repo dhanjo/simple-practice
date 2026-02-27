@@ -80,9 +80,9 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
     await page.getByRole('button', { name: 'Sign in' }).click();
     console.log('✅ Sign in clicked');
 
-    // Wait for login to complete — use networkidle like the working project
-    await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(2500);
+    // Wait for login to complete
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(5000);
 
     // Verify we landed on the dashboard
     const currentUrl = page.url();
@@ -100,8 +100,8 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
       waitUntil: 'domcontentloaded',
       timeout: 60000,
     });
-    await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(3000);
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(5000);
 
     // ── 3. Search for client ────────────────────────────────────
     step(`Searching for client: ${data.clientSearch}`);
@@ -122,8 +122,8 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
     step(`Found client: "${clientName?.trim()}"`);
     await page.waitForTimeout(500);
     await clientOption.click();
-    await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(3000);
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(5000);
 
     // ── 5. Wait for Upcoming Appointments ───────────────────────
     step('Waiting for upcoming appointments');
@@ -188,8 +188,8 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
 
     // ── 7. Wait for appointment form ────────────────────────────
     step('Waiting for appointment form');
-    await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(3000);
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(5000);
     const startDateInput = page.getByRole('textbox', { name: /start date/i });
     await startDateInput.waitFor({ state: 'visible', timeout: 15_000 });
     await page.waitForTimeout(2000);
