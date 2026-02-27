@@ -2,8 +2,16 @@
   "name": "simple-practice",
   "version": "1.0.0",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "tsx src/server.ts",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop simple-practice-api",
+    "pm2:restart": "pm2 restart simple-practice-api",
+    "pm2:logs": "pm2 logs simple-practice-api",
+    "setup": "npx playwright install chromium && mkdir -p logs",
     "test": "npx playwright test",
     "test:reschedule": "npx playwright test appointment-reschedule",
     "test:headed": "npx playwright test --headed",
@@ -12,7 +20,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "SimplePractice appointment reschedule automation API",
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@types/cors": "^2.8.19",

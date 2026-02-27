@@ -1,20 +1,21 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import 'dotenv/config';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY; // optional — if set, all requests must include it
 const TEST_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max per test run
+const MAX_QUEUE_SIZE = 50; // max pending requests
+const QUEUE_WAIT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max wait in queue
 
 app.use(cors());
 app.use(express.json());
 
-// Track whether a test is already running (only one browser at a time)
-let isRunning = false;
-let currentProcess: ChildProcess | null = null;
-let startedAt: Date | null = null;
+/* ── State ────────────────────────────────────────────────────────── */
 
 interface RescheduleBody {
   clientSearch: string;
@@ -22,28 +23,92 @@ interface RescheduleBody {
   newTime: string;
 }
 
-// ── Request logging middleware ──
+interface QueueItem {
+  id: string;
+  params: RescheduleBody;
+  resolve: (result: RunResult) => void;
+  queuedAt: Date;
+  timedOut: boolean;
+}
+
+interface RunResult {
+  success: boolean;
+  requestId: string;
+  output: string;
+  duration: number;
+}
+
+let isRunning = false;
+let currentProcess: ChildProcess | null = null;
+let startedAt: Date | null = null;
+const bootTime = new Date();
+
+// Stats
+let totalProcessed = 0;
+let totalSuccess = 0;
+let totalFailed = 0;
+let lastResult: (RunResult & { clientSearch: string; finishedAt: string }) | null = null;
+
+// Request queue — sequential processing, one browser at a time
+const queue: QueueItem[] = [];
+
+/* ── Helpers ──────────────────────────────────────────────────────── */
+
+function log(msg: string) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function generateRequestId(): string {
+  return crypto.randomBytes(6).toString('hex');
+}
+
+/** Strip ANSI escape codes from Playwright output */
+function stripAnsi(str: string): string {
+  return str.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\x1B\]0;[^\x07]*\x07/g, '');
+}
+
+/* ── Request logging middleware ────────────────────────────────────── */
+
 app.use((req, _res, next) => {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${req.method} ${req.path}`);
+  log(`${req.method} ${req.path}`);
   next();
 });
 
-app.post('/api/reschedule', async (req, res) => {
+/* ── API Key auth middleware (only if API_KEY is configured) ──────── */
+
+function authMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  if (!API_KEY) return next();
+  const provided = req.headers['x-api-key'] as string | undefined;
+  if (provided !== API_KEY) {
+    return res.status(401).json({ success: false, error: 'Invalid or missing API key' });
+  }
+  next();
+}
+
+/* ── POST /api/reschedule ─────────────────────────────────────────── */
+
+app.post('/api/reschedule', authMiddleware, async (req, res) => {
+  const requestId = generateRequestId();
   const { clientSearch, newDate, newTime } = req.body as RescheduleBody;
 
   // ── Validate required fields ──
   if (!clientSearch || !newDate || !newTime) {
     return res.status(400).json({
       success: false,
+      requestId,
       error: 'Missing required fields: clientSearch, newDate, newTime',
     });
   }
 
-  // ── Basic format validation ──
+  // ── Format validation ──
   if (!/^[0-9]{2}\/[0-9]{2}\/[0-9]{4}$/.test(newDate)) {
     return res.status(400).json({
       success: false,
+      requestId,
       error: 'newDate must be in MM/DD/YYYY format (e.g. "03/05/2026")',
     });
   }
@@ -51,52 +116,121 @@ app.post('/api/reschedule', async (req, res) => {
   if (!/^[0-9]{1,2}:[0-9]{2}\s?(AM|PM)$/i.test(newTime)) {
     return res.status(400).json({
       success: false,
+      requestId,
       error: 'newTime must be in HH:MM AM/PM format (e.g. "03:00 PM")',
     });
   }
 
-  // ── Prevent concurrent runs ──
-  if (isRunning) {
+  // ── Queue limit check ──
+  if (queue.length >= MAX_QUEUE_SIZE) {
     return res.status(429).json({
       success: false,
-      error: 'A reschedule is already in progress. Try again later.',
+      requestId,
+      error: `Queue is full (${MAX_QUEUE_SIZE} pending). Try again later.`,
     });
   }
 
+  // ── Enqueue and respond when processed ──
+  const position = queue.length + (isRunning ? 1 : 0);
+  log(`[${requestId}] Queued: client=${clientSearch}, date=${newDate}, time=${newTime} (position ${position})`);
+
+  const result = await enqueue(requestId, { clientSearch, newDate, newTime });
+  res.status(result.success ? 200 : 500).json(result);
+});
+
+/* ── Queue management ─────────────────────────────────────────────── */
+
+function enqueue(requestId: string, params: RescheduleBody): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const item: QueueItem = { id: requestId, params, resolve, queuedAt: new Date(), timedOut: false };
+    queue.push(item);
+
+    // Auto-timeout: if this request sits in queue too long, resolve with error
+    setTimeout(() => {
+      if (!item.timedOut && queue.includes(item)) {
+        item.timedOut = true;
+        const idx = queue.indexOf(item);
+        if (idx !== -1) queue.splice(idx, 1);
+        log(`[${requestId}] Queue timeout — removed after ${QUEUE_WAIT_TIMEOUT_MS / 1000}s`);
+        resolve({
+          success: false,
+          requestId,
+          output: 'Request timed out waiting in queue. Try again later.',
+          duration: 0,
+        });
+      }
+    }, QUEUE_WAIT_TIMEOUT_MS);
+
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (isRunning || queue.length === 0) return;
+
+  // Skip items that timed out while waiting
+  while (queue.length > 0 && queue[0].timedOut) {
+    queue.shift();
+  }
+  if (queue.length === 0) return;
+
   isRunning = true;
+  const item = queue.shift()!;
   startedAt = new Date();
-  console.log(`[${startedAt.toISOString()}] Starting reschedule: client=${clientSearch}, date=${newDate}, time=${newTime}`);
+  const waitTime = Math.round((startedAt.getTime() - item.queuedAt.getTime()) / 1000);
+  log(`[${item.id}] Processing: client=${item.params.clientSearch} (waited ${waitTime}s, ${queue.length} remaining)`);
 
   try {
-    const result = await runPlaywrightTest({ clientSearch, newDate, newTime });
-    console.log(`[${new Date().toISOString()}] Reschedule ${result.success ? 'succeeded' : 'failed'} in ${result.duration}s`);
-    res.json(result);
+    const result = await runPlaywrightTest(item.id, item.params);
+    totalProcessed++;
+    if (result.success) totalSuccess++;
+    else totalFailed++;
+    lastResult = {
+      ...result,
+      clientSearch: item.params.clientSearch,
+      finishedAt: new Date().toISOString(),
+    };
+    log(`[${item.id}] ${result.success ? 'SUCCESS' : 'FAILED'}: client=${item.params.clientSearch} in ${result.duration}s`);
+    item.resolve(result);
   } catch (err: any) {
-    console.error(`[${new Date().toISOString()}] Reschedule error:`, err.message);
-    res.status(500).json({
+    totalProcessed++;
+    totalFailed++;
+    const errorResult: RunResult = {
       success: false,
-      error: err.message || 'Unknown error',
-    });
+      requestId: item.id,
+      output: err.message || 'Unknown error',
+      duration: 0,
+    };
+    log(`[${item.id}] ERROR: client=${item.params.clientSearch} — ${err.message}`);
+    item.resolve(errorResult);
   } finally {
     isRunning = false;
     currentProcess = null;
     startedAt = null;
+    processQueue();
   }
-});
+}
 
-// ── Health check ──
+/* ── GET /api/health ──────────────────────────────────────────────── */
+
 app.get('/api/health', (_req, res) => {
+  const uptimeSeconds = Math.round((Date.now() - bootTime.getTime()) / 1000);
   res.json({
     status: 'ok',
+    uptime: uptimeSeconds,
     isRunning,
+    queueLength: queue.length,
     startedAt: startedAt?.toISOString() ?? null,
+    stats: { totalProcessed, totalSuccess, totalFailed },
+    lastResult: lastResult
+      ? { success: lastResult.success, requestId: lastResult.requestId, clientSearch: lastResult.clientSearch, duration: lastResult.duration, finishedAt: lastResult.finishedAt }
+      : null,
   });
 });
 
-// ── Run the Playwright test as a child process ──
-function runPlaywrightTest(
-  params: RescheduleBody,
-): Promise<{ success: boolean; output: string; duration: number }> {
+/* ── Run the Playwright test as a child process ───────────────────── */
+
+function runPlaywrightTest(requestId: string, params: RescheduleBody): Promise<RunResult> {
   return new Promise((resolve) => {
     const start = Date.now();
     let stdout = '';
@@ -119,7 +253,6 @@ function runPlaywrightTest(
 
     currentProcess = testProcess;
 
-    // Kill the process if it exceeds the timeout
     const timeout = setTimeout(() => {
       testProcess.kill('SIGTERM');
       setTimeout(() => {
@@ -127,31 +260,65 @@ function runPlaywrightTest(
       }, 5000);
     }, TEST_TIMEOUT_MS);
 
-    testProcess.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    testProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
+    testProcess.stdout.on('data', (d) => { stdout += d.toString(); });
+    testProcess.stderr.on('data', (d) => { stderr += d.toString(); });
 
     testProcess.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Math.round((Date.now() - start) / 1000);
-      const output = (stdout + '\n' + stderr).trim();
-
-      if (code === 0) {
-        resolve({ success: true, output, duration });
-      } else {
-        resolve({ success: false, output, duration });
-      }
+      const output = stripAnsi((stdout + '\n' + stderr).trim());
+      resolve({ success: code === 0, requestId, output, duration });
     });
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`🚀 Reschedule API running on http://localhost:${PORT}`);
-  console.log(`   POST /api/reschedule  — run appointment reschedule`);
-  console.log(`   GET  /api/health      — check server status`);
+/* ── Graceful shutdown ────────────────────────────────────────────── */
+
+let server: ReturnType<typeof app.listen>;
+
+function shutdown(signal: string) {
+  log(`${signal} received — shutting down gracefully`);
+
+  if (currentProcess && !currentProcess.killed) {
+    currentProcess.kill('SIGTERM');
+  }
+
+  while (queue.length > 0) {
+    const item = queue.shift()!;
+    item.resolve({ success: false, requestId: item.id, output: 'Server shutting down', duration: 0 });
+  }
+
+  server.close(() => {
+    log('Server closed');
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 10_000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+/* ── Uncaught error handlers — keep server alive ──────────────────── */
+
+process.on('uncaughtException', (err) => {
+  log(`UNCAUGHT EXCEPTION: ${err.message}`);
+  console.error(err.stack);
+  // Don't exit — keep processing queue
+});
+
+process.on('unhandledRejection', (reason) => {
+  log(`UNHANDLED REJECTION: ${reason}`);
+  // Don't exit — keep processing queue
+});
+
+/* ── Start ────────────────────────────────────────────────────────── */
+
+server = app.listen(PORT, () => {
+  log(`🚀 Reschedule API running on http://localhost:${PORT}`);
+  log(`   POST /api/reschedule  — run appointment reschedule`);
+  log(`   GET  /api/health      — check server status`);
+  log(`   Auth: ${API_KEY ? 'API key required (X-API-Key header)' : 'open (set API_KEY in .env to enable)'}`);
+  log(`   Max queue: ${MAX_QUEUE_SIZE} | Queue timeout: ${QUEUE_WAIT_TIMEOUT_MS / 1000}s`);
 });
 

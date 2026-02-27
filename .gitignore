@@ -11,4 +11,12 @@ node_modules/
 
 # VSCode
 .vscode/
+
+# Debug artifacts
 debug-*.png
+
+# Build output
+dist/
+
+# PM2 logs
+logs/
