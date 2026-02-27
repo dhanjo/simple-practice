@@ -53,8 +53,8 @@ test.describe('Appointment Reschedule', () => {
 
   test('should reschedule an existing appointment to a new date and time', async ({ page }) => {
     // ── 1. Read dynamic parameters ──────────────────────────────────
-    const email        = requiredEnv('SP_EMAIL');
-    const password     = requiredEnv('SP_PASSWORD');
+    const email        = 'cematthewslcsw@gmail.com';
+    const password     = 'Njalone08#';
     const clientSearch = requiredEnv('SP_CLIENT_SEARCH');
     const newDate      = requiredEnv('SP_NEW_DATE');
     const newTime      = requiredEnv('SP_NEW_TIME');
@@ -92,6 +92,13 @@ test.describe('Appointment Reschedule', () => {
     await humanDelay(page, 200, 400);
 
     await page.getByRole('button', { name: 'Sign in' }).click();
+
+    // Debug: wait a moment then log what happened after clicking sign in
+    await page.waitForTimeout(5_000);
+    step(`After sign-in click — URL: ${page.url()}`);
+    const bodyText = await page.locator('body').innerText().catch(() => '(could not read body)');
+    step(`Page text (first 500 chars): ${bodyText.substring(0, 500)}`);
+
     await page.waitForURL('**/secure.simplepractice.com/**', { timeout: 30_000 });
     step('Login successful');
     await humanDelay(page, 600, 1000);
