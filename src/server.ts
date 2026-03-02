@@ -81,14 +81,14 @@ function authMiddleware(
 
 app.post('/api/reschedule', authMiddleware, async (req, res) => {
   const requestId = generateRequestId();
-  const { clientSearch, newDate, newTime, currentAppointmentDate } = req.body as RescheduleParams;
+  const { spEmail, spPassword, clientSearch, newDate, newTime, currentAppointmentDate } = req.body as RescheduleParams;
 
   // ── Validate required fields ──
-  if (!clientSearch || !newDate || !newTime) {
+  if (!spEmail || !spPassword || !clientSearch || !newDate || !newTime) {
     return res.status(400).json({
       success: false,
       requestId,
-      error: 'Missing required fields: clientSearch, newDate, newTime',
+      error: 'Missing required fields: spEmail, spPassword, clientSearch, newDate, newTime',
     });
   }
 
@@ -127,7 +127,7 @@ app.post('/api/reschedule', authMiddleware, async (req, res) => {
   }
 
   // ── Enqueue and respond when processed ──
-  const params: RescheduleParams = { clientSearch, newDate, newTime };
+  const params: RescheduleParams = { spEmail, spPassword, clientSearch, newDate, newTime };
   if (currentAppointmentDate) params.currentAppointmentDate = currentAppointmentDate;
 
   const position = queue.length + (isRunning ? 1 : 0);

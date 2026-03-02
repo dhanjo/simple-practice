@@ -1,6 +1,8 @@
 import { chromium, Browser, Page } from 'playwright';
 
 export interface RescheduleParams {
+  spEmail: string;    // SimplePractice login email
+  spPassword: string; // SimplePractice login password
   clientSearch: string;
   newDate: string;   // MM/DD/YYYY
   newTime: string;   // HH:MM AM/PM
@@ -68,13 +70,13 @@ export async function rescheduleAppointment(data: RescheduleParams): Promise<Res
     step('Signing in');
     await emailField.click();
     await page.waitForTimeout(600);
-    await emailField.pressSequentially('cematthewslcsw@gmail.com', { delay: 80 });
+    await emailField.pressSequentially(data.spEmail, { delay: 80 });
     await page.waitForTimeout(900);
 
     const passwordField = page.getByRole('textbox', { name: 'Password' });
     await passwordField.click();
     await page.waitForTimeout(500);
-    await passwordField.pressSequentially('Njalone08#', { delay: 110 });
+    await passwordField.pressSequentially(data.spPassword, { delay: 110 });
     await page.waitForTimeout(1200);
 
     await page.getByRole('button', { name: 'Sign in' }).click();
