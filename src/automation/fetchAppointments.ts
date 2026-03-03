@@ -109,17 +109,19 @@ export async function fetchAppointments(data: FetchAppointmentsParams): Promise<
     await page.getByRole('button', { name: 'Sign in' }).click();
     step('Sign in clicked');
 
+    // Wait for SAML redirect chain to complete (can take a while)
     await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(8000);
 
-    // Verify login
+    // Verify login — SAML redirect may need extra time
     const currentUrl = page.url();
     step(`After login — URL: ${currentUrl}`);
     if (!currentUrl.includes('secure.simplepractice.com')) {
-      await page.waitForURL('**/secure.simplepractice.com/**', { timeout: 30_000 });
+      step('Waiting for SAML redirect to complete...');
+      await page.waitForURL('**/secure.simplepractice.com/**', { timeout: 60_000 });
     }
     step('Login successful');
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(2000);
 
     // ── 2. Navigate to calendar (to establish session context) ───
     step('Navigating to calendar to establish session');
