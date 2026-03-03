@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { rescheduleAppointment, RescheduleParams, RescheduleResult } from './automation/rescheduleAppointment';
+import { fetchAppointments, FetchAppointmentsParams, FetchAppointmentsResult } from './automation/fetchAppointments';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,7 +17,8 @@ app.use(express.json());
 
 interface QueueItem {
   id: string;
-  params: RescheduleParams;
+  type: 'reschedule' | 'fetch-appointments';
+  params: RescheduleParams | FetchAppointmentsParams;
   resolve: (result: RunResult) => void;
   queuedAt: Date;
   timedOut: boolean;
@@ -27,6 +29,7 @@ interface RunResult {
   requestId: string;
   message?: string;
   error?: string;
+  data?: any;
   duration: number;
 }
 
@@ -133,15 +136,66 @@ app.post('/api/reschedule', authMiddleware, async (req, res) => {
   const position = queue.length + (isRunning ? 1 : 0);
   log(`[${requestId}] Queued: client=${clientSearch}, date=${newDate}, time=${newTime}${currentAppointmentDate ? `, currentAppt=${currentAppointmentDate}` : ''} (position ${position})`);
 
-  const result = await enqueue(requestId, params);
+  const result = await enqueue(requestId, 'reschedule', params);
+  res.status(result.success ? 200 : 500).json(result);
+});
+
+/* ── POST /api/appointments ────────────────────────────────────────── */
+
+app.post('/api/appointments', authMiddleware, async (req, res) => {
+  const requestId = generateRequestId();
+  const { spEmail, spPassword, startDate, endDate, timezone } = req.body as FetchAppointmentsParams;
+
+  // ── Validate required fields ──
+  if (!spEmail || !spPassword || !startDate || !endDate) {
+    return res.status(400).json({
+      success: false,
+      requestId,
+      error: 'Missing required fields: spEmail, spPassword, startDate, endDate',
+    });
+  }
+
+  // ── Format validation (YYYY-MM-DD) ──
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(startDate)) {
+    return res.status(400).json({
+      success: false,
+      requestId,
+      error: 'startDate must be in YYYY-MM-DD format (e.g. "2026-03-03")',
+    });
+  }
+
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(endDate)) {
+    return res.status(400).json({
+      success: false,
+      requestId,
+      error: 'endDate must be in YYYY-MM-DD format (e.g. "2026-03-04")',
+    });
+  }
+
+  // ── Queue limit check ──
+  if (queue.length >= MAX_QUEUE_SIZE) {
+    return res.status(429).json({
+      success: false,
+      requestId,
+      error: `Queue is full (${MAX_QUEUE_SIZE} pending). Try again later.`,
+    });
+  }
+
+  const params: FetchAppointmentsParams = { spEmail, spPassword, startDate, endDate };
+  if (timezone) params.timezone = timezone;
+
+  const position = queue.length + (isRunning ? 1 : 0);
+  log(`[${requestId}] Queued fetch-appointments: range=${startDate} → ${endDate} (position ${position})`);
+
+  const result = await enqueue(requestId, 'fetch-appointments', params);
   res.status(result.success ? 200 : 500).json(result);
 });
 
 /* ── Queue management ─────────────────────────────────────────────── */
 
-function enqueue(requestId: string, params: RescheduleParams): Promise<RunResult> {
+function enqueue(requestId: string, type: 'reschedule' | 'fetch-appointments', params: RescheduleParams | FetchAppointmentsParams): Promise<RunResult> {
   return new Promise((resolve) => {
-    const item: QueueItem = { id: requestId, params, resolve, queuedAt: new Date(), timedOut: false };
+    const item: QueueItem = { id: requestId, type, params, resolve, queuedAt: new Date(), timedOut: false };
     queue.push(item);
 
     // Auto-timeout: if this request sits in queue too long, resolve with error
@@ -177,24 +231,39 @@ async function processQueue() {
   const item = queue.shift()!;
   startedAt = new Date();
   const waitTime = Math.round((startedAt.getTime() - item.queuedAt.getTime()) / 1000);
-  log(`[${item.id}] Processing: client=${item.params.clientSearch} (waited ${waitTime}s, ${queue.length} remaining)`);
+  const label = item.type === 'reschedule'
+    ? `client=${(item.params as RescheduleParams).clientSearch}`
+    : `range=${(item.params as FetchAppointmentsParams).startDate}→${(item.params as FetchAppointmentsParams).endDate}`;
+  log(`[${item.id}] Processing ${item.type}: ${label} (waited ${waitTime}s, ${queue.length} remaining)`);
 
   try {
     const start = Date.now();
-    const result = await rescheduleAppointment(item.params);
-    const duration = Math.round((Date.now() - start) / 1000);
-    const runResult: RunResult = result.success
-      ? { success: true, requestId: item.id, message: result.message, duration }
-      : { success: false, requestId: item.id, error: result.message, duration };
+
+    let runResult: RunResult;
+
+    if (item.type === 'reschedule') {
+      const result = await rescheduleAppointment(item.params as RescheduleParams);
+      const duration = Math.round((Date.now() - start) / 1000);
+      runResult = result.success
+        ? { success: true, requestId: item.id, message: result.message, duration }
+        : { success: false, requestId: item.id, error: result.message, duration };
+      lastResult = {
+        ...runResult,
+        clientSearch: (item.params as RescheduleParams).clientSearch,
+        finishedAt: new Date().toISOString(),
+      };
+    } else {
+      const result = await fetchAppointments(item.params as FetchAppointmentsParams);
+      const duration = Math.round((Date.now() - start) / 1000);
+      runResult = result.success
+        ? { success: true, requestId: item.id, message: result.message, data: result.data, duration }
+        : { success: false, requestId: item.id, error: result.message, duration };
+    }
+
     totalProcessed++;
-    if (result.success) totalSuccess++;
+    if (runResult.success) totalSuccess++;
     else totalFailed++;
-    lastResult = {
-      ...runResult,
-      clientSearch: item.params.clientSearch,
-      finishedAt: new Date().toISOString(),
-    };
-    log(`[${item.id}] ${result.success ? 'SUCCESS' : 'FAILED'}: client=${item.params.clientSearch} in ${duration}s`);
+    log(`[${item.id}] ${runResult.success ? 'SUCCESS' : 'FAILED'}: ${item.type} ${label} in ${runResult.duration}s`);
     item.resolve(runResult);
   } catch (err: any) {
     totalProcessed++;
@@ -205,7 +274,7 @@ async function processQueue() {
       error: err.message || 'An unexpected error occurred.',
       duration: 0,
     };
-    log(`[${item.id}] ERROR: client=${item.params.clientSearch} — ${err.message}`);
+    log(`[${item.id}] ERROR: ${item.type} ${label} — ${err.message}`);
     item.resolve(errorResult);
   } finally {
     isRunning = false;
@@ -270,9 +339,10 @@ process.on('unhandledRejection', (reason) => {
 /* ── Start ────────────────────────────────────────────────────────── */
 
 server = app.listen(PORT, () => {
-  log(`🚀 Reschedule API running on http://localhost:${PORT}`);
-  log(`   POST /api/reschedule  — run appointment reschedule`);
-  log(`   GET  /api/health      — check server status`);
+  log(`🚀 SimplePractice API running on http://localhost:${PORT}`);
+  log(`   POST /api/reschedule    — reschedule an appointment`);
+  log(`   POST /api/appointments  — fetch appointments for a date range`);
+  log(`   GET  /api/health        — check server status`);
   log(`   Auth: ${API_KEY ? 'API key required (X-API-Key header)' : 'open (set API_KEY in .env to enable)'}`);
   log(`   Max queue: ${MAX_QUEUE_SIZE} | Queue timeout: ${QUEUE_WAIT_TIMEOUT_MS / 1000}s`);
 });
