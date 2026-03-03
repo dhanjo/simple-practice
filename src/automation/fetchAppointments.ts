@@ -19,6 +19,89 @@ function step(label: string) {
 }
 
 /**
+ * Format raw JSON:API appointment data into a clean, presentable structure.
+ */
+function formatAppointments(rawData: any, startDate: string, endDate: string): any {
+  const items: any[] = rawData?.data || [];
+
+  const clientAppointments: any[] = [];
+  const nonClientAppointments: any[] = [];
+
+  for (const item of items) {
+    const attrs = item.attributes || {};
+    const rels = item.relationships || {};
+
+    if (item.type === 'appointments') {
+      // Client appointment
+      const clientId = rels.client?.data?.id || null;
+      const clinicianRelId = rels.clinician?.data?.id || null;
+
+      clientAppointments.push({
+        id: item.id,
+        clientName: attrs.title || null,
+        startTime: attrs.startTime || null,
+        endTime: attrs.endTime || null,
+        duration: attrs.duration || null,
+        status: attrs.attendanceStatus || null,
+        clinicianId: attrs.clinicianId || clinicianRelId || null,
+        clientId,
+        officeName: attrs.officeName || null,
+        officeId: attrs.officeId || null,
+        isFullDay: attrs.fullDay === 'true',
+        isRecurring: attrs.isRecurring === 'true',
+        recurringSchedule: attrs.recurringSchedule || null,
+        hasNote: attrs.hasNote === 'true',
+        hasSignedNote: attrs.hasNoteSignature === 'true',
+        clientConfirmationStatus: attrs.clientConfirmationStatus || null,
+        cptCodes: (attrs.cptCodes || []).map((c: any) => ({
+          code: c.code,
+          description: c.description,
+          rate: c.ratePerUnit || c.rate || null,
+        })),
+      });
+    } else if (item.type === 'nonClientAppointments') {
+      // Non-client appointment (break, block, pay period, etc.)
+      const clinicianRelId = rels.clinician?.data?.id || null;
+
+      nonClientAppointments.push({
+        id: item.id,
+        title: attrs.title || null,
+        startTime: attrs.startTime || null,
+        endTime: attrs.endTime || null,
+        duration: attrs.duration || null,
+        status: attrs.attendanceStatus || null,
+        clinicianId: attrs.clinicianId || clinicianRelId || null,
+        officeName: attrs.officeName || null,
+        officeId: attrs.officeId || null,
+        isFullDay: attrs.fullDay === 'true',
+        isRecurring: attrs.isRecurring === 'true',
+        recurringSchedule: attrs.recurringSchedule || null,
+      });
+    }
+  }
+
+  // Sort by startTime
+  const sortByTime = (a: any, b: any) => {
+    const ta = a.startTime ? new Date(a.startTime).getTime() : 0;
+    const tb = b.startTime ? new Date(b.startTime).getTime() : 0;
+    return ta - tb;
+  };
+  clientAppointments.sort(sortByTime);
+  nonClientAppointments.sort(sortByTime);
+
+  return {
+    summary: {
+      dateRange: { start: startDate, end: endDate },
+      totalAppointments: clientAppointments.length + nonClientAppointments.length,
+      totalClientAppointments: clientAppointments.length,
+      totalNonClientAppointments: nonClientAppointments.length,
+    },
+    appointments: clientAppointments,
+    nonClientAppointments,
+  };
+}
+
+/**
  * Build the SimplePractice appointments API URL for a given date range.
  */
 function buildAppointmentsUrl(startDate: string, endDate: string, tzOffset: string): string {
@@ -168,10 +251,11 @@ export async function fetchAppointments(data: FetchAppointmentsParams): Promise<
     }
 
     step(`Appointments fetched successfully`);
+    const formatted = formatAppointments(fetchResult.body, data.startDate, data.endDate);
     return {
       success: true,
       message: `Appointments fetched for ${data.startDate} to ${data.endDate}`,
-      data: fetchResult.body,
+      data: formatted,
     };
 
   } catch (error: any) {
