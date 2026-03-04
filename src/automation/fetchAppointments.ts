@@ -206,8 +206,8 @@ export async function fetchAppointments(data: FetchAppointmentsParams): Promise<
     step('Login successful');
     await page.waitForTimeout(2000);
 
-    // ── 2. Navigate to calendar (to establish session context) ───
-    step('Navigating to calendar to establish session');
+    // ── 2. Navigate to calendar to get session cookies + CSRF token ───
+    step('Navigating to calendar to extract session');
     await page.goto('https://secure.simplepractice.com/calendar/appointments', {
       waitUntil: 'domcontentloaded',
       timeout: 60000,
@@ -215,43 +215,52 @@ export async function fetchAppointments(data: FetchAppointmentsParams): Promise<
     await page.waitForLoadState('domcontentloaded');
     await page.waitForTimeout(5000);
 
-    // ── 3. Extract CSRF token + fetch appointments via page.evaluate ─
+    // ── 3. Extract cookies + CSRF token from the browser ─────────
+    step('Extracting cookies and CSRF token');
+    const csrfToken = await page.evaluate(() => {
+      const meta = document.querySelector('meta[name="csrf-token"]');
+      return meta?.getAttribute('content') || '';
+    });
+
+    const cookies = await context.cookies('https://secure.simplepractice.com');
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    step(`Extracted ${cookies.length} cookies, CSRF token: ${csrfToken ? 'found' : 'NOT FOUND'}`);
+
+    // ── 4. Close the browser — we don't need it anymore ──────────
+    await browser.close();
+    browser = null;
+    step('Browser closed — making API call directly from Node.js');
+
+    // ── 5. Fetch appointments via Node.js fetch (no browser needed) ─
     const tzOffset = data.timezone || '-05:00';
     const apiUrl = buildAppointmentsUrl(data.startDate, data.endDate, tzOffset);
     step(`Fetching appointments from SP API: ${data.startDate} to ${data.endDate}`);
 
-    const fetchResult = await page.evaluate(async (url: string) => {
-      // Get CSRF token from meta tag
-      const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-      const csrfToken = csrfMeta?.getAttribute('content') || '';
+    const response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/vnd.api+json',
+        'Api-Version': '2025-03-21',
+        'X-Csrf-Token': csrfToken,
+        'Cookie': cookieHeader,
+        'Referer': 'https://secure.simplepractice.com/calendar/appointments',
+      },
+    });
 
-      const response = await fetch(url, {
-        method: 'GET',
-        credentials: 'include',
-        headers: {
-          'Accept': 'application/vnd.api+json',
-          'Api-Version': '2025-03-21',
-          'X-Csrf-Token': csrfToken,
-        },
-      });
-
-      if (!response.ok) {
-        return { ok: false, status: response.status, body: await response.text() };
-      }
-
-      return { ok: true, status: response.status, body: await response.json() };
-    }, apiUrl);
-
-    if (!fetchResult.ok) {
-      step(`SP API returned ${fetchResult.status}`);
+    if (!response.ok) {
+      const errorBody = await response.text();
+      step(`SP API returned ${response.status}: ${errorBody.substring(0, 200)}`);
       return {
         success: false,
-        message: `SimplePractice API returned status ${fetchResult.status}`,
+        message: `SimplePractice API returned status ${response.status}`,
       };
     }
 
+    const rawBody = await response.json();
+
     step(`Appointments fetched successfully`);
-    const formatted = formatAppointments(fetchResult.body, data.startDate, data.endDate);
+    const formatted = formatAppointments(rawBody, data.startDate, data.endDate);
     return {
       success: true,
       message: `Appointments fetched for ${data.startDate} to ${data.endDate}`,
